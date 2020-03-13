@@ -1,17 +1,14 @@
 package net.corda.training.flow
 
 import co.paralleluniverse.fibers.Suspendable
+import net.corda.core.contracts.Command
+import net.corda.core.contracts.StateAndContract
 import net.corda.core.contracts.requireThat
-import net.corda.core.flows.CollectSignaturesFlow
-import net.corda.core.flows.FinalityFlow
-import net.corda.core.flows.FlowLogic
-import net.corda.core.flows.FlowSession
-import net.corda.core.flows.InitiatedBy
-import net.corda.core.flows.InitiatingFlow
-import net.corda.core.flows.SignTransactionFlow
-import net.corda.core.flows.StartableByRPC
+import net.corda.core.flows.*
+import net.corda.core.identity.Party
 import net.corda.core.transactions.SignedTransaction
 import net.corda.core.transactions.TransactionBuilder
+import net.corda.training.contract.IOUContract
 import net.corda.training.state.IOUState
 
 /**
@@ -25,10 +22,16 @@ import net.corda.training.state.IOUState
 class IOUIssueFlow(val state: IOUState) : FlowLogic<SignedTransaction>() {
     @Suspendable
     override fun call(): SignedTransaction {
-        // Placeholder code to avoid type error when running the tests. Remove before starting the flow task!
-        return serviceHub.signInitialTransaction(
-                TransactionBuilder(notary = null)
-        )
+        val issueCommand = Command(IOUContract.Commands.Issue(), state.participants.map{it.owningKey})
+        val stateAndContract = StateAndContract(state, IOUContract.IOU_CONTRACT_ID)
+        val notary = serviceHub.networkMapCache.notaryIdentities.single()
+        val transactionBuilder = TransactionBuilder(notary).withItems(issueCommand, stateAndContract)
+        transactionBuilder.verify(serviceHub)
+        val partiallySignedTx: SignedTransaction = serviceHub.signInitialTransaction(transactionBuilder)
+        val requiredSigners: List<Party> = state.participants.filterNot{it == ourIdentity}
+        val cannotInlineThis = requiredSigners.map{initiateFlow(it)}
+        val signedTransaction = subFlow(CollectSignaturesFlow(partiallySignedTx, cannotInlineThis.toSet()))
+        return subFlow(FinalityFlow(signedTransaction, cannotInlineThis))
     }
 }
 
@@ -42,10 +45,12 @@ class IOUIssueFlowResponder(val flowSession: FlowSession): FlowLogic<Unit>() {
     override fun call() {
         val signedTransactionFlow = object : SignTransactionFlow(flowSession) {
             override fun checkTransaction(stx: SignedTransaction) = requireThat {
-                val output = stx.tx.outputs.single().data
+                val output = stx.tx.outputsOfType<IOUState>().single()
                 "This must be an IOU transaction" using (output is IOUState)
+                "Lender cannot be borrower" using (output.lender != output.borrower)
             }
         }
-        subFlow(signedTransactionFlow)
+        val signedTx = subFlow(signedTransactionFlow)
+        subFlow(ReceiveFinalityFlow(flowSession, signedTx.id))
     }
 }
